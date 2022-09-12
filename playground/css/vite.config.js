@@ -22,7 +22,7 @@ module.exports = {
   },
   css: {
     modules: {
-      generateScopedName: '[name]__[local]___[hash:base64:5]'
+      generateScopedName: '[name]__[local]___[hash]'
 
       // example of how getJSON can be used to generate
       // typescript typings for css modules class names

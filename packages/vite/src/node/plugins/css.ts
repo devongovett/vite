@@ -13,6 +13,7 @@ import type {
 } from 'rollup'
 import { dataToEsm } from '@rollup/pluginutils'
 import colors from 'picocolors'
+import camelCase from 'lodash.camelcase'
 import MagicString from 'magic-string'
 import type * as PostCSS from 'postcss'
 import type Sass from 'sass'
@@ -112,6 +113,7 @@ const htmlProxyRE = /(\?|&)html-proxy\b/
 const commonjsProxyRE = /\?commonjs-proxy/
 const inlineRE = /(\?|&)inline\b/
 const inlineCSSRE = /(\?|&)inline-css\b/
+const styleAttrRE = /(\?|&)style-attr\b/
 const usedRE = /(\?|&)used\b/
 const varRE = /^var\(/i
 
@@ -406,6 +408,10 @@ export function cssPostPlugin(config: ResolvedConfig): Plugin {
       const isHTMLProxy = htmlProxyRE.test(id)
       const query = parseRequest(id)
       if (inlineCSS && isHTMLProxy) {
+        if (styleAttrRE.test(id)) {
+          css = css.replace(/"/g, '&quot;')
+        }
+
         addToHTMLProxyTransformResult(
           `${getHash(cleanUrl(id))}_${Number.parseInt(query!.index)}`,
           css
@@ -423,6 +429,7 @@ export function cssPostPlugin(config: ResolvedConfig): Plugin {
         } else {
           let content = css
           if (config.build.minify) {
+            // TODO: remove this??
             content = await minifyCSS(content, config)
           }
           code = `export default ${JSON.stringify(content)}`
@@ -542,7 +549,6 @@ export function cssPostPlugin(config: ResolvedConfig): Plugin {
           if (chunk.isEntry && isPureCssChunk) cssEntryFiles.add(cssAssetName)
 
           chunkCSS = resolveAssetUrlsInCss(chunkCSS, cssAssetName)
-          chunkCSS = await finalizeCss(chunkCSS, true, config)
 
           // emit corresponding css file
           const fileHandle = this.emitFile({
@@ -566,7 +572,6 @@ export function cssPostPlugin(config: ResolvedConfig): Plugin {
           if (chunk.isEntry) {
             return null
           }
-          chunkCSS = await finalizeCss(chunkCSS, true, config)
           let cssString = JSON.stringify(chunkCSS)
           cssString =
             renderAssetUrlInJS(
@@ -598,7 +603,6 @@ export function cssPostPlugin(config: ResolvedConfig): Plugin {
         }
       } else {
         chunkCSS = resolveAssetUrlsInCss(chunkCSS, cssBundleName)
-        // finalizeCss is called for the aggregated chunk in generateBundle
 
         outputToExtractedCSSMap.set(
           opts,
@@ -658,10 +662,9 @@ export function cssPostPlugin(config: ResolvedConfig): Plugin {
         })
       }
 
-      let extractedCss = outputToExtractedCSSMap.get(opts)
+      const extractedCss = outputToExtractedCSSMap.get(opts)
       if (extractedCss && !hasEmitted) {
         hasEmitted = true
-        extractedCss = await finalizeCss(extractedCss, true, config)
         this.emitFile({
           name: cssBundleName,
           type: 'asset',
@@ -722,12 +725,6 @@ function createCSSResolvers(config: ResolvedConfig): CSSAtImportResolvers {
   }
 }
 
-function getCssResolversKeys(
-  resolvers: CSSAtImportResolvers
-): Array<keyof CSSAtImportResolvers> {
-  return Object.keys(resolvers) as unknown as Array<keyof CSSAtImportResolvers>
-}
-
 async function compileCSS(
   id: string,
   code: string,
@@ -761,7 +758,8 @@ async function compileCSS(
     !postcssConfig &&
     !isModule &&
     !needInlineImport &&
-    !hasUrl
+    !hasUrl &&
+    !config.build.minify
   ) {
     return { code, map: null }
   }
@@ -830,77 +828,11 @@ async function compileCSS(
   const postcssPlugins =
     postcssConfig && postcssConfig.plugins ? postcssConfig.plugins.slice() : []
 
-  if (needInlineImport) {
-    postcssPlugins.unshift(
-      (await import('postcss-import')).default({
-        async resolve(id, basedir) {
-          const publicFile = checkPublicFile(id, config)
-          if (publicFile) {
-            return publicFile
-          }
-
-          const resolved = await atImportResolvers.css(
-            id,
-            path.join(basedir, '*')
-          )
-
-          if (resolved) {
-            return path.resolve(resolved)
-          }
-          return id
-        },
-        nameLayer(index) {
-          return `vite--anon-layer-${getHash(id)}-${index}`
-        }
-      })
-    )
-  }
-  postcssPlugins.push(
-    UrlRewritePostcssPlugin({
-      replacer: urlReplacer,
-      logger: config.logger
-    })
-  )
-
-  if (isModule) {
-    postcssPlugins.unshift(
-      (await import('postcss-modules')).default({
-        ...modulesOptions,
-        getJSON(
-          cssFileName: string,
-          _modules: Record<string, string>,
-          outputFileName: string
-        ) {
-          modules = _modules
-          if (modulesOptions && typeof modulesOptions.getJSON === 'function') {
-            modulesOptions.getJSON(cssFileName, _modules, outputFileName)
-          }
-        },
-        async resolve(id: string) {
-          for (const key of getCssResolversKeys(atImportResolvers)) {
-            const resolved = await atImportResolvers[key](id)
-            if (resolved) {
-              return path.resolve(resolved)
-            }
-          }
-
-          return id
-        }
-      })
-    )
-  }
-
-  if (!postcssPlugins.length) {
-    return {
-      code,
-      map: preprocessorMap
-    }
-  }
-
-  let postcssResult: PostCSS.Result
-  try {
+  let css = code,
+    map = preprocessorMap
+  if (postcssPlugins.length) {
     // postcss is an unbundled dep and should be lazy imported
-    postcssResult = await (await import('postcss'))
+    const postcssResult = await (await import('postcss'))
       .default(postcssPlugins)
       .process(code, {
         ...postcssOptions,
@@ -949,39 +881,131 @@ async function compileCSS(
         config.logger.warn(colors.yellow(msg))
       }
     }
-  } catch (e) {
-    e.message = `[postcss] ${e.message}`
-    e.code = code
-    e.loc = {
-      column: e.column,
-      line: e.line
+
+    if (devSourcemap) {
+      const rawPostcssMap = postcssResult.map.toJSON()
+
+      const postcssMap = await formatPostcssSourceMap(
+        // version property of rawPostcssMap is declared as string
+        // but actually it is a number
+        rawPostcssMap as Omit<RawSourceMap, 'version'> as ExistingRawSourceMap,
+        cleanUrl(id)
+      )
+
+      map = combineSourcemapsIfExists(cleanUrl(id), postcssMap, preprocessorMap)
     }
-    throw e
+
+    css = postcssResult.css
   }
 
-  if (!devSourcemap) {
-    return {
-      ast: postcssResult,
-      code: postcssResult.css,
-      map: { mappings: '' },
-      modules,
-      deps
+  const lightningCss = await import('lightningcss')
+  let dependencies, exports
+  if (styleAttrRE.test(id)) {
+    const res = lightningCss.transformStyleAttribute({
+      filename: id,
+      code: Buffer.from(css),
+      analyzeDependencies: true,
+      minify: !!config.build.minify
+    })
+    dependencies = res.dependencies
+    code = res.code.toString()
+  } else {
+    const res = await lightningCss.bundleAsync({
+      filename: id,
+      resolver: {
+        read(filename) {
+          if (filename === id) {
+            // TODO: add source map inline comment
+            return css
+          }
+
+          try {
+            return fs.readFileSync(filename, 'utf8')
+          } catch (err) {
+            // TODO: handle external urls
+            return ''
+          }
+        },
+        async resolve(id, from) {
+          const publicFile = checkPublicFile(id, config)
+          if (publicFile) {
+            return publicFile
+          }
+
+          const resolved = await atImportResolvers.css(id, from)
+
+          if (resolved) {
+            return path.resolve(resolved)
+          }
+          return id
+        }
+      },
+      sourceMap: devSourcemap,
+      analyzeDependencies: true,
+      cssModules:
+        isModule && typeof modulesOptions?.generateScopedName === 'string'
+          ? {
+              pattern: modulesOptions?.generateScopedName, // TODO: function not supported.
+              dashedIdents: false
+            }
+          : isModule,
+      minify: !!config.build.minify
+      // TODO: set browser targets to enable transpilation
+    })
+
+    dependencies = res.dependencies
+    exports = res.exports
+    code = res.code.toString()
+    map = res.map ? JSON.parse(res.map.toString()) : undefined
+  }
+
+  if (dependencies) {
+    for (const dep of dependencies) {
+      // TODO: do we need to add to deps?
+
+      if (dep.type === 'url') {
+        const resolved = await urlReplacer(dep.url, dep.loc.filePath)
+        code = code.replaceAll(dep.placeholder, resolved)
+      }
     }
   }
 
-  const rawPostcssMap = postcssResult.map.toJSON()
-
-  const postcssMap = await formatPostcssSourceMap(
-    // version property of rawPostcssMap is declared as string
-    // but actually it is a number
-    rawPostcssMap as Omit<RawSourceMap, 'version'> as ExistingRawSourceMap,
-    cleanUrl(id)
-  )
+  if (exports) {
+    modules = {}
+    for (const name in exports) {
+      const exp = exports[name]
+      let className = exp.name
+      for (const composes of exp.composes) {
+        className += ' ' + composes.name
+      }
+      if (modulesOptions && modulesOptions.localsConvention) {
+        switch (modulesOptions.localsConvention) {
+          case 'camelCase':
+            modules[name] = className
+          // fallthrough
+          case 'camelCaseOnly':
+            modules[camelCase(name)] = className
+            break
+          case 'dashes':
+            modules[name] = className
+          // fallthrough
+          case 'dashesOnly':
+            modules[
+              name.replace(/-+(\w)/g, (_, firstLetter) =>
+                firstLetter.toUpperCase()
+              )
+            ] = className
+            break
+        }
+      } else {
+        modules[name] = className
+      }
+    }
+  }
 
   return {
-    ast: postcssResult,
-    code: postcssResult.css,
-    map: combineSourcemapsIfExists(cleanUrl(id), postcssMap, preprocessorMap),
+    code,
+    map,
     modules,
     deps
   }
@@ -1027,21 +1051,6 @@ function combineSourcemapsIfExists(
         map2 as RawSourceMap
       ]) as ExistingRawSourceMap)
     : map1
-}
-
-async function finalizeCss(
-  css: string,
-  minify: boolean,
-  config: ResolvedConfig
-) {
-  // hoist external @imports and @charset to the top of the CSS chunk per spec (#1845 and #6333)
-  if (css.includes('@import') || css.includes('@charset')) {
-    css = await hoistAtRules(css)
-  }
-  if (minify && config.build.minify) {
-    css = await minifyCSS(css, config)
-  }
-  return css
 }
 
 interface PostCSSConfigResult {

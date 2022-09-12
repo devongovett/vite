@@ -27,13 +27,13 @@
 }
 
 .css-image-set-with-var {
-  --bg-img: url('../nested/asset.png');
+  --bg-img: url('/nested/asset.png');
   background-image: -webkit-image-set(var(--bg-img) 1x, var(--bg-img) 2x);
   background-size: 10px;
 }
 
 .css-image-set-mix-url-var {
-  --bg-img: url('../nested/asset.png');
+  --bg-img: url('/nested/asset.png');
   background-image: -webkit-image-set(
     var(--bg-img) 1x,
     url('../nested/asset.png') 2x

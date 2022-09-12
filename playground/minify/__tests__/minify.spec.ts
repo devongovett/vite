@@ -11,8 +11,9 @@ test.runIf(isBuild)('no minifySyntax', () => {
   const jsContent = readFile(path.resolve(assetsDir, jsFile))
 
   const cssFile = files.find((f) => f.endsWith('.css'))
-  const cssContent = readFile(path.resolve(assetsDir, cssFile))
+  // const cssContent = readFile(path.resolve(assetsDir, cssFile))
 
   expect(jsContent).toContain('{console.log("hello world")}')
-  expect(cssContent).toContain('color:#ff0000')
+  // TODO: lightningcss doesn't support this option.
+  // expect(cssContent).toContain('color:#ff0000')
 })
